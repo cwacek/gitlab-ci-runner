@@ -71,7 +71,10 @@ module GitlabCi
     def register_runner(public_key, token)
       body = {
         public_key: public_key,
-        token: token
+        token: token,
+        supports: {
+          docker: 1
+        }
       }
 
       opts = {
