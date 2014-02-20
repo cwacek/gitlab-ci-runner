@@ -6,6 +6,12 @@ require 'tempfile'
 require 'fileutils'
 require 'bundler'
 
+require 'docker'
+require 'shellwords'
+require 'pry'
+# The changes Docker always makes to the filesystem
+DOCKER_FS_CHANGES = [{"Kind"=>0, "Path"=>"/dev"}, {"Kind"=>1, "Path"=>"/dev/kmsg"}]
+
 module GitlabCi
   class Build
     TIMEOUT = 7200
@@ -16,6 +22,7 @@ module GitlabCi
       @commands = data[:commands].to_a
       @ref = data[:ref]
       @ref_name = data[:ref_name]
+      @opts = data[:opts] or {}
       @id = data[:id]
       @project_id = data[:project_id]
       @repo_url = data[:repo_url]
@@ -28,20 +35,35 @@ module GitlabCi
     def run
       @state = :running
 
-      @commands.unshift(checkout_cmd)
+      setup_commands = []
+      setup_commands.unshift(checkout_cmd)
+
 
       if repo_exists? && @allow_git_fetch
-        @commands.unshift(fetch_cmd)
+        setup_commands.unshift(fetch_cmd)
       else
         FileUtils.rm_rf(project_dir)
         FileUtils.mkdir_p(project_dir)
-        @commands.unshift(clone_cmd)
+        setup_commands.unshift(clone_cmd)
       end
 
-      @commands.each do |line|
-        status = Bundler.with_clean_env { command line }
-        @state = :failed and return unless status
+      if @opts[:use_docker]
+          begin
+            setup_docker setup_commands
+          rescue
+            status = false
+          else
+            status = docker_run @commands
+          end
+          cleanup_docker
+      else
+        @commands = setup_commands + @commands
+        @commands.each do |line|
+          status = Bundler.with_clean_env { command line }
+        end
       end
+
+      @state = :failed and return unless status
 
       @state = :success
     end
@@ -75,9 +97,81 @@ module GitlabCi
 
     private
 
+    def setup_docker(setup_commands)
+      raise RuntimeError, "docker daemon not found" if Docker.version.nil?
+      setup_commands.each do |cmd|
+        status = Bundler.with_clean_env { command cmd }
+        raise RuntimeError unless status
+      end
+
+      raise NameError, "No Dockerfile found" unless FileTest.file? "#{project_dir}/Dockerfile"
+
+      build_image = Docker::Image.build_from_dir(project_dir)
+      @docker_images = [build_image]
+      @docker_containers = []
+    end
+
+    # Run each command within the docker container, but persist state.
+    # Fail if the command fails.
+    def docker_run(commands)
+
+      have_error = false
+      @run_start_time = Time.now
+      host_image = @docker_images[0]
+
+      commands.each do |cmd|
+        container = Docker::Container.create 'Image' => host_image.id,
+          'Cmd' => Shellwords.shellwords(cmd)
+        @docker_containers << container
+
+        container.start
+        begin
+          # Wait the rest of the time we were alotted to run this
+          container.wait @timeout - (Time.now - @run_start_time)
+
+          if container.json['State']['ExitCode'] != 0
+            have_error = true
+            break
+          end
+
+        rescue Docker::Error::TimeoutError
+          @output << "TIMEOUT"
+          container.kill # tries increasingly harsher methods to kill the process.
+          break
+        ensure
+          stdout, stderr = container.attach logs: true, stdout: true, stderr: true, stream: false
+          stdout.each do |pipe|
+            @output << GitlabCi::Encode.encode!(pipe)
+          end
+          stderr.each do |pipe|
+            @output << GitlabCi::Encode.encode!(pipe)
+          end
+        end
+
+        # Look and see if the filesystem changed at all.
+        # If it did, save the container and run the next command from it.
+        if (container.changes - DOCKER_FS_CHANGES).length > 0
+          host_image = container.commit
+          @docker_images << host_image
+        end
+      end
+    end
+
+    def cleanup_docker
+      @docker_containers.each do |container|
+        container.delete
+      end
+      @docker_images.each do |image|
+        begin
+          image.remove
+        rescue
+          # Exceptions here are okay. container.delete removes images too
+        end
+      end
+    end
+
     def command(cmd)
       cmd = cmd.strip
-      status = 0
 
       @output ||= ""
       @output << "\n"
