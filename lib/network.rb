@@ -72,9 +72,14 @@ module GitlabCi
       body = {
         public_key: public_key,
         token: token,
-        supports: {
-          docker: 1
-        }
+        capabilities: [
+          {
+            name: 'docker',
+            version: 1,
+            description: "Builds container from Dockerfile in top level directory. Runs all commands inside of it."
+          }
+      ]
+
       }
 
       opts = {
